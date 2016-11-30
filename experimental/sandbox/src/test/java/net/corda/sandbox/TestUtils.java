@@ -14,6 +14,7 @@ import static org.junit.Assert.*;
 
 public class TestUtils {
 
+    private static ArrayList<FileSystem> tmpFileSystems = new ArrayList<>();
     private static Path jarFSDir = null;
     private static Path tmpdir;
 
@@ -23,8 +24,9 @@ public class TestUtils {
         final InputStream in = TestUtils.class.getResourceAsStream(resourcePathToJar);
         Path copiedJar = tmpdir.resolve("tmp-resource.jar");
         Files.copy(in, copiedJar, StandardCopyOption.REPLACE_EXISTING);
-
+        in.close();
         final FileSystem fs = FileSystems.newFileSystem(copiedJar, null);
+        tmpFileSystems.add(fs);
         jarFSDir = fs.getRootDirectories().iterator().next();
     }
 
@@ -32,8 +34,9 @@ public class TestUtils {
         final InputStream in = TestUtils.class.getResourceAsStream(resourcePathToJar);
         Path sandboxJar = tmpdir.resolve("tmp-sandbox.jar");
         Files.copy(in, sandboxJar, StandardCopyOption.REPLACE_EXISTING);
+        in.close();
         final FileSystem sandboxFs = FileSystems.newFileSystem(sandboxJar, null);
-        
+        tmpFileSystems.add(sandboxFs);
         return sandboxFs.getRootDirectories().iterator().next();
     }
     
@@ -42,7 +45,13 @@ public class TestUtils {
     }
 
     public static void cleanupTmpJar() throws IOException {
+        for (FileSystem fs: tmpFileSystems) {
+            fs.close();
+        }
+        tmpFileSystems.clear();
+        jarFSDir = null;
         Files.walkFileTree(tmpdir, new Reaper());
+        tmpdir = null;
     }
 
     public static void checkAllCosts(final int allocCost, final int jumpCost, final int invokeCost, final int throwCost) {
