@@ -40,7 +40,7 @@ class DBTransactionStorage : TransactionStorage {
             val old = txStorage.get(transaction.id)
             if (old == null) {
                 txStorage.put(transaction.id, transaction)
-                updatesPublisher.onNext(transaction)
+                updatesPublisher.bufferUntilDatabaseCommit().onNext(transaction)
                 true
             } else {
                 false
@@ -59,12 +59,11 @@ class DBTransactionStorage : TransactionStorage {
     }
 
     val updatesPublisher = PublishSubject.create<SignedTransaction>().toSerialized()
-    override val updates: Observable<SignedTransaction>
-        get() = updatesPublisher
+    override val updates: Observable<SignedTransaction> = updatesPublisher.wrapWithDatabaseTransaction()
 
     override fun track(): Pair<List<SignedTransaction>, Observable<SignedTransaction>> {
         synchronized(txStorage) {
-            return Pair(txStorage.values.toList(), updates.bufferUntilSubscribed())
+            return Pair(txStorage.values.toList(), updatesPublisher.bufferUntilSubscribed().wrapWithDatabaseTransaction())
         }
     }
 

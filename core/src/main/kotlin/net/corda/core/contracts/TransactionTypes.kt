@@ -17,8 +17,11 @@ sealed class TransactionType {
      *
      * Note: Presence of _signatures_ is not checked, only the public keys to be signed for.
      */
+    @Throws(TransactionVerificationException::class)
     fun verify(tx: LedgerTransaction) {
         require(tx.notary != null || tx.timestamp == null) { "Transactions with timestamps must be notarised." }
+        val duplicates = detectDuplicateInputs(tx)
+        if (duplicates.isNotEmpty()) throw TransactionVerificationException.DuplicateInputStates(tx, duplicates)
         val missing = verifySigners(tx)
         if (missing.isNotEmpty()) throw TransactionVerificationException.SignersMissing(tx, missing.toList())
         verifyTransaction(tx)
@@ -35,6 +38,19 @@ sealed class TransactionType {
         return missing
     }
 
+    /** Check that the inputs are unique. */
+    private fun detectDuplicateInputs(tx: LedgerTransaction): Set<StateRef> {
+        var seenInputs = emptySet<StateRef>()
+        var duplicates = emptySet<StateRef>()
+        tx.inputs.forEach { state ->
+            if (seenInputs.contains(state.ref)) {
+                duplicates += state.ref
+            }
+            seenInputs += state.ref
+        }
+        return duplicates
+    }
+
     /**
      * Return the list of public keys that that require signatures for the transaction type.
      * Note: the notary key is checked separately for all transactions and need not be included.
@@ -49,15 +65,20 @@ sealed class TransactionType {
         /** Just uses the default [TransactionBuilder] with no special logic */
         class Builder(notary: Party?) : TransactionBuilder(General(), notary) {}
 
-        /**
-         * Check the transaction is contract-valid by running the verify() for each input and output state contract.
-         * If any contract fails to verify, the whole transaction is considered to be invalid.
-         */
         override fun verifyTransaction(tx: LedgerTransaction) {
-            // Make sure the notary has stayed the same. As we can't tell how inputs and outputs connect, if there
-            // are any inputs, all outputs must have the same notary.
-            // TODO: Is that the correct set of restrictions? May need to come back to this, see if we can be more
-            //       flexible on output notaries.
+            verifyNoNotaryChange(tx)
+            verifyEncumbrances(tx)
+            verifyContracts(tx)
+        }
+
+        /**
+         * Make sure the notary has stayed the same. As we can't tell how inputs and outputs connect, if there
+         * are any inputs, all outputs must have the same notary.
+         *
+         * TODO: Is that the correct set of restrictions? May need to come back to this, see if we can be more
+         *       flexible on output notaries.
+         */
+        private fun verifyNoNotaryChange(tx: LedgerTransaction) {
             if (tx.notary != null && tx.inputs.isNotEmpty()) {
                 tx.outputs.forEach {
                     if (it.notary != tx.notary) {
@@ -65,27 +86,18 @@ sealed class TransactionType {
                     }
                 }
             }
+        }
 
-            val ctx = tx.toTransactionForContract()
-
-            // TODO: This will all be replaced in future once the sandbox and contract constraints work is done.
-            val contracts = (ctx.inputs.map { it.contract } + ctx.outputs.map { it.contract }).toSet()
-            for (contract in contracts) {
-                try {
-                    contract.verify(ctx)
-                } catch(e: Throwable) {
-                    throw TransactionVerificationException.ContractRejection(tx, contract, e)
-                }
-            }
-
+        private fun verifyEncumbrances(tx: LedgerTransaction) {
             // Validate that all encumbrances exist within the set of input states.
-            tx.inputs.filter { it.state.data.encumbrance != null }.forEach { encumberedInput ->
-                val isMissing = tx.inputs.none {
-                    it.ref.txhash == encumberedInput.ref.txhash && it.ref.index == encumberedInput.state.data.encumbrance
+            val encumberedInputs = tx.inputs.filter { it.state.encumbrance != null }
+            encumberedInputs.forEach { encumberedInput ->
+                val encumbranceStateExists = tx.inputs.any {
+                    it.ref.txhash == encumberedInput.ref.txhash && it.ref.index == encumberedInput.state.encumbrance
                 }
-                if (isMissing) {
+                if (!encumbranceStateExists) {
                     throw TransactionVerificationException.TransactionMissingEncumbranceException(
-                            tx, encumberedInput.state.data.encumbrance!!,
+                            tx, encumberedInput.state.encumbrance!!,
                             TransactionVerificationException.Direction.INPUT
                     )
                 }
@@ -94,11 +106,28 @@ sealed class TransactionType {
             // Check that, in the outputs, an encumbered state does not refer to itself as the encumbrance,
             // and that the number of outputs can contain the encumbrance.
             for ((i, output) in tx.outputs.withIndex()) {
-                val encumbranceIndex = output.data.encumbrance ?: continue
+                val encumbranceIndex = output.encumbrance ?: continue
                 if (encumbranceIndex == i || encumbranceIndex >= tx.outputs.size) {
                     throw TransactionVerificationException.TransactionMissingEncumbranceException(
                             tx, encumbranceIndex,
                             TransactionVerificationException.Direction.OUTPUT)
+                }
+            }
+        }
+
+        /**
+         * Check the transaction is contract-valid by running the verify() for each input and output state contract.
+         * If any contract fails to verify, the whole transaction is considered to be invalid.
+         */
+        private fun verifyContracts(tx: LedgerTransaction) {
+            val ctx = tx.toTransactionForContract()
+            // TODO: This will all be replaced in future once the sandbox and contract constraints work is done.
+            val contracts = (ctx.inputs.map { it.contract } + ctx.outputs.map { it.contract }).toSet()
+            for (contract in contracts) {
+                try {
+                    contract.verify(ctx)
+                } catch(e: Throwable) {
+                    throw TransactionVerificationException.ContractRejection(tx, contract, e)
                 }
             }
         }

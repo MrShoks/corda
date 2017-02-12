@@ -107,11 +107,11 @@ object X509Utilities {
     }
 
     /**
-     * Helper method to create Subject field contents
+     * Return a bogus X509 for dev purposes. Use [getX509Name] for something more real.
      */
-    fun getDevX509Name(domain: String): X500Name {
+    fun getDevX509Name(commonName: String): X500Name {
         val nameBuilder = X500NameBuilder(BCStyle.INSTANCE)
-        nameBuilder.addRDN(BCStyle.CN, domain)
+        nameBuilder.addRDN(BCStyle.CN, commonName)
         nameBuilder.addRDN(BCStyle.O, "R3")
         nameBuilder.addRDN(BCStyle.OU, "corda")
         nameBuilder.addRDN(BCStyle.L, "London")
@@ -380,7 +380,6 @@ object X509Utilities {
                 DERSequence(purposes))
 
         val subjectAlternativeNames = ArrayList<ASN1Encodable>()
-        subjectAlternativeNames.add(GeneralName(GeneralName.dNSName, subject.getRDNs(BCStyle.CN).first().first.value))
 
         for (subjectAlternativeNameDomain in subjectAlternativeNameDomains) {
             subjectAlternativeNames.add(GeneralName(GeneralName.dNSName, subjectAlternativeNameDomain))
@@ -431,14 +430,8 @@ object X509Utilities {
     fun loadCertificateFromPEMFile(filename: Path): X509Certificate {
         val reader = PemReader(FileReader(filename.toFile()))
         val pemObject = reader.readPemObject()
-        val certFact = CertificateFactory.getInstance("X.509", BouncyCastleProvider.PROVIDER_NAME)
-        val inputStream = ByteArrayInputStream(pemObject.content)
-        try {
-            val cert = certFact.generateCertificate(inputStream) as X509Certificate
-            cert.checkValidity()
-            return cert
-        } finally {
-            inputStream.close()
+        return CertificateStream(pemObject.content.inputStream()).nextCertificate().apply {
+            checkValidity()
         }
     }
 
@@ -574,27 +567,31 @@ object X509Utilities {
                              storePassword: String,
                              keyPassword: String,
                              caKeyStore: KeyStore,
-                             caKeyPassword: String): KeyStore {
-        val rootCA = loadCertificateAndKey(caKeyStore,
+                             caKeyPassword: String,
+                             commonName: String): KeyStore {
+        val rootCA = X509Utilities.loadCertificateAndKey(
+                caKeyStore,
                 caKeyPassword,
                 CORDA_ROOT_CA_PRIVATE_KEY)
-        val intermediateCA = loadCertificateAndKey(caKeyStore,
+        val intermediateCA = X509Utilities.loadCertificateAndKey(
+                caKeyStore,
                 caKeyPassword,
                 CORDA_INTERMEDIATE_CA_PRIVATE_KEY)
 
         val serverKey = generateECDSAKeyPairForSSL()
         val host = InetAddress.getLocalHost()
-        val subject = getDevX509Name(host.canonicalHostName)
-        val serverCert = createServerCert(subject,
+        val serverCert = createServerCert(
+                getDevX509Name(commonName),
                 serverKey.public,
                 intermediateCA,
-                if (host.canonicalHostName == host.hostName) listOf() else listOf(host.hostName),
+                listOf(host.hostName),
                 listOf(host.hostAddress))
 
         val keyPass = keyPassword.toCharArray()
         val keyStore = loadOrCreateKeyStore(keyStoreFilePath, storePassword)
 
-        keyStore.addOrReplaceKey(CORDA_CLIENT_CA_PRIVATE_KEY,
+        keyStore.addOrReplaceKey(
+                CORDA_CLIENT_CA_PRIVATE_KEY,
                 serverKey.private,
                 keyPass,
                 arrayOf(serverCert, intermediateCA.certificate, rootCA.certificate))
@@ -605,4 +602,12 @@ object X509Utilities {
 
         return keyStore
     }
+}
+
+val X500Name.commonName: String get() = getRDNs(BCStyle.CN).first().first.value.toString()
+
+class CertificateStream(val input: InputStream) {
+    private val certificateFactory = CertificateFactory.getInstance("X.509")
+
+    fun nextCertificate(): X509Certificate = certificateFactory.generateCertificate(input) as X509Certificate
 }

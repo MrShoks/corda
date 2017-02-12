@@ -36,17 +36,19 @@ sourceSets {
     }
 }
 
+compileTestJava.dependsOn tasks.getByPath(':node:capsule:buildCordaJAR')
+
 dependencies {
     compile project(':core')
     compile project(':client')
-    compile project(':test-utils')
+    testCompile project(':test-utils')
 
     compile "org.graphstream:gs-core:1.3"
     compile("org.graphstream:gs-ui:1.3") {
         exclude group: "bouncycastle"
     }
 
-    runtime "net.corda:corda:$corda_version"
+    runtime project(path: ":node:capsule", configuration: 'runtimeArtifacts')
 }
 
 mainClassName = "net.corda.docs.ClientRpcTutorialKt"
@@ -70,12 +72,11 @@ task integrationTest(type: Test) {
     classpath = sourceSets.integrationTest.runtimeClasspath
 }
 
-task deployNodes(type: net.corda.plugins.Cordform, dependsOn: [':install', 'build']) {
+task deployNodes(type: net.corda.plugins.Cordform, dependsOn: ['build']) {
     directory "./build/nodes"
     networkMap "Notary"
     node {
         name "Notary"
-        dirName "notary"
         nearestCity "London"
         advertisedServices = ["corda.notary.validating"]
         artemisPort 10002
@@ -84,7 +85,6 @@ task deployNodes(type: net.corda.plugins.Cordform, dependsOn: [':install', 'buil
     }
     node {
         name "Alice"
-        dirName "alice"
         nearestCity "London"
         advertisedServices = []
         artemisPort 10004

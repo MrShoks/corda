@@ -4,9 +4,11 @@ import com.google.common.util.concurrent.ListenableFuture
 import com.google.common.util.concurrent.SettableFuture
 import net.corda.core.catch
 import net.corda.core.node.services.DEFAULT_SESSION_ID
+import net.corda.core.node.services.PartyInfo
 import net.corda.core.serialization.DeserializeAsKotlinObjectDef
 import net.corda.core.serialization.deserialize
 import net.corda.core.serialization.serialize
+import org.bouncycastle.asn1.x500.X500Name
 import java.time.Instant
 import java.util.*
 import java.util.concurrent.atomic.AtomicBoolean
@@ -37,11 +39,12 @@ interface MessagingService {
      * @param sessionID identifier for the session the message is part of. For services listening before
      * a session is established, use [DEFAULT_SESSION_ID].
      */
-    fun addMessageHandler(topic: String = "", sessionID: Long = DEFAULT_SESSION_ID, callback: (Message, MessageHandlerRegistration) -> Unit): MessageHandlerRegistration
+    fun addMessageHandler(topic: String = "", sessionID: Long = DEFAULT_SESSION_ID, callback: (ReceivedMessage, MessageHandlerRegistration) -> Unit): MessageHandlerRegistration
 
     /**
      * The provided function will be invoked for each received message whose topic and session matches.  The callback
-     * will run on threads provided by the messaging service, and the callback is expected to be thread safe as a result.
+     * will run on the main server thread provided when the messaging service is constructed, and a database
+     * transaction is set up for you automatically.
      *
      * The returned object is an opaque handle that may be used to un-register handlers later with [removeMessageHandler].
      * The handle is passed to the callback as well, to avoid race conditions whereby the callback wants to unregister
@@ -49,7 +52,7 @@ interface MessagingService {
      *
      * @param topicSession identifier for the topic and session to listen for messages arriving on.
      */
-    fun addMessageHandler(topicSession: TopicSession, callback: (Message, MessageHandlerRegistration) -> Unit): MessageHandlerRegistration
+    fun addMessageHandler(topicSession: TopicSession, callback: (ReceivedMessage, MessageHandlerRegistration) -> Unit): MessageHandlerRegistration
 
     /**
      * Removes a handler given the object returned from [addMessageHandler]. The callback will no longer be invoked once
@@ -78,6 +81,9 @@ interface MessagingService {
      */
     fun createMessage(topicSession: TopicSession, data: ByteArray, uuid: UUID = UUID.randomUUID()): Message
 
+    /** Given information about either a specific node or a service returns its corresponding address */
+    fun getAddressOfParty(partyInfo: PartyInfo): MessageRecipients
+
     /** Returns an address that refers to this node. */
     val myAddress: SingleMessageRecipient
 }
@@ -104,7 +110,7 @@ fun MessagingService.createMessage(topic: String, sessionID: Long = DEFAULT_SESS
  * @param sessionID identifier for the session the message is part of. For services listening before
  * a session is established, use [DEFAULT_SESSION_ID].
  */
-fun MessagingService.runOnNextMessage(topic: String, sessionID: Long, callback: (Message) -> Unit)
+fun MessagingService.runOnNextMessage(topic: String, sessionID: Long, callback: (ReceivedMessage) -> Unit)
         = runOnNextMessage(TopicSession(topic, sessionID), callback)
 
 /**
@@ -114,7 +120,7 @@ fun MessagingService.runOnNextMessage(topic: String, sessionID: Long, callback: 
  *
  * @param topicSession identifier for the topic and session to listen for messages arriving on.
  */
-inline fun MessagingService.runOnNextMessage(topicSession: TopicSession, crossinline callback: (Message) -> Unit) {
+inline fun MessagingService.runOnNextMessage(topicSession: TopicSession, crossinline callback: (ReceivedMessage) -> Unit) {
     val consumed = AtomicBoolean()
     addMessageHandler(topicSession) { msg, reg ->
         removeMessageHandler(reg)
@@ -126,7 +132,7 @@ inline fun MessagingService.runOnNextMessage(topicSession: TopicSession, crossin
 
 /**
  * Returns a [ListenableFuture] of the next message payload ([Message.data]) which is received on the given topic and sessionId.
- * The payload is deserilaized to an object of type [M]. Any exceptions thrown will be captured by the future.
+ * The payload is deserialized to an object of type [M]. Any exceptions thrown will be captured by the future.
  */
 fun <M : Any> MessagingService.onNext(topic: String, sessionId: Long): ListenableFuture<M> {
     val messageFuture = SettableFuture.create<M>()
@@ -155,12 +161,7 @@ interface MessageHandlerRegistration
  * a session is established, use [DEFAULT_SESSION_ID].
  */
 data class TopicSession(val topic: String, val sessionID: Long = DEFAULT_SESSION_ID) {
-    companion object {
-        val Blank = TopicSession("", DEFAULT_SESSION_ID)
-    }
-
     fun isBlank() = topic.isBlank() && sessionID == DEFAULT_SESSION_ID
-
     override fun toString(): String = "$topic.$sessionID"
 }
 
@@ -179,6 +180,14 @@ interface Message {
     val data: ByteArray
     val debugTimestamp: Instant
     val uniqueMessageId: UUID
+}
+
+// TODO Have ReceivedMessage point to the TLS certificate of the peer, and [peer] would simply be the subject DN of that.
+// The certificate would need to be serialised into the message header or just its fingerprint and then download it via RPC,
+// or something like that.
+interface ReceivedMessage : Message {
+    /** The authenticated sender. */
+    val peer: X500Name
 }
 
 /** A singleton that's useful for validating topic strings */

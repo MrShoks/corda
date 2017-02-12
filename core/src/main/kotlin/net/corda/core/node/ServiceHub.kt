@@ -1,8 +1,6 @@
 package net.corda.core.node
 
-import net.corda.core.contracts.StateRef
-import net.corda.core.contracts.TransactionResolutionException
-import net.corda.core.contracts.TransactionState
+import net.corda.core.contracts.*
 import net.corda.core.flows.FlowLogic
 import net.corda.core.flows.FlowStateMachine
 import net.corda.core.messaging.MessagingService
@@ -31,11 +29,12 @@ interface ServiceHub {
     val myInfo: NodeInfo
 
     /**
-     * Given a list of [SignedTransaction]s, writes them to the local storage for validated transactions and then
-     * sends them to the vault for further processing.
+     * Given a [SignedTransaction], writes it to the local storage for validated transactions and then
+     * sends them to the vault for further processing. Expects to be run within a database transaction.
      *
      * @param txs The transactions to record.
      */
+    // TODO: Make this take a single tx.
     fun recordTransactions(txs: Iterable<SignedTransaction>)
 
     /**
@@ -49,7 +48,18 @@ interface ServiceHub {
     }
 
     /**
+     * Given a [StateRef] loads the referenced transaction and returns a [StateAndRef<T>]
+     *
+     * @throws TransactionResolutionException if the [StateRef] points to a non-existent transaction.
+     */
+    fun <T : ContractState> toStateAndRef(ref: StateRef): StateAndRef<T> {
+        val definingTx =  storageService.validatedTransactions.getTransaction(ref.txhash) ?: throw TransactionResolutionException(ref.txhash)
+        return definingTx.tx.outRef<T>(ref.index)
+    }
+
+    /**
      * Will check [logicType] and [args] against a whitelist and if acceptable then construct and initiate the flow.
+     * Note that you must be on the server thread to call this method.
      *
      * @throws IllegalFlowLogicException or IllegalArgumentException if there are problems with the [logicType] or [args].
      */
@@ -73,7 +83,6 @@ interface ServiceHub {
      * Typical use is during signing in flows and for unit test signing.
      */
     val notaryIdentityKey: KeyPair get() = this.keyManagementService.toKeyPair(this.myInfo.notaryIdentity.owningKey.keys)
-
 }
 
 /**

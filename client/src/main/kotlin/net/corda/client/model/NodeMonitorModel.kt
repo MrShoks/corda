@@ -2,19 +2,17 @@ package net.corda.client.model
 
 import com.google.common.net.HostAndPort
 import javafx.beans.property.SimpleObjectProperty
-import net.corda.client.CordaRPCClient
 import net.corda.core.flows.StateMachineRunId
-import net.corda.core.node.services.NetworkMapCache
+import net.corda.core.messaging.CordaRPCOps
+import net.corda.core.messaging.StateMachineInfo
+import net.corda.core.messaging.StateMachineUpdate
+import net.corda.core.node.services.NetworkMapCache.MapChange
 import net.corda.core.node.services.StateMachineTransactionMapping
 import net.corda.core.node.services.Vault
+import net.corda.core.seconds
 import net.corda.core.transactions.SignedTransaction
-import net.corda.flows.CashCommand
-import net.corda.flows.CashFlow
-import net.corda.node.services.config.NodeSSLConfiguration
-import net.corda.node.services.messaging.CordaRPCOps
-import net.corda.node.services.messaging.StateMachineInfo
-import net.corda.node.services.messaging.StateMachineUpdate
-import net.corda.node.services.messaging.startFlow
+import net.corda.node.services.config.SSLConfiguration
+import net.corda.node.services.messaging.CordaRPCClient
 import rx.Observable
 import rx.subjects.PublishSubject
 
@@ -39,17 +37,14 @@ class NodeMonitorModel {
     private val transactionsSubject = PublishSubject.create<SignedTransaction>()
     private val stateMachineTransactionMappingSubject = PublishSubject.create<StateMachineTransactionMapping>()
     private val progressTrackingSubject = PublishSubject.create<ProgressTrackingEvent>()
-    private val networkMapSubject = PublishSubject.create<NetworkMapCache.MapChange>()
+    private val networkMapSubject = PublishSubject.create<MapChange>()
 
     val stateMachineUpdates: Observable<StateMachineUpdate> = stateMachineUpdatesSubject
     val vaultUpdates: Observable<Vault.Update> = vaultUpdatesSubject
     val transactions: Observable<SignedTransaction> = transactionsSubject
     val stateMachineTransactionMapping: Observable<StateMachineTransactionMapping> = stateMachineTransactionMappingSubject
     val progressTracking: Observable<ProgressTrackingEvent> = progressTrackingSubject
-    val networkMap: Observable<NetworkMapCache.MapChange> = networkMapSubject
-
-    private val clientToServiceSource = PublishSubject.create<CashCommand>()
-    val clientToService: PublishSubject<CashCommand> = clientToServiceSource
+    val networkMap: Observable<MapChange> = networkMapSubject
 
     val proxyObservable = SimpleObjectProperty<CordaRPCOps?>()
 
@@ -57,8 +52,10 @@ class NodeMonitorModel {
      * Register for updates to/from a given vault.
      * TODO provide an unsubscribe mechanism
      */
-    fun register(nodeHostAndPort: HostAndPort, sslConfig: NodeSSLConfiguration, username: String, password: String) {
-        val client = CordaRPCClient(nodeHostAndPort, sslConfig)
+    fun register(nodeHostAndPort: HostAndPort, sslConfig: SSLConfiguration, username: String, password: String) {
+        val client = CordaRPCClient(nodeHostAndPort, sslConfig){
+            maxRetryInterval = 10.seconds.toMillis()
+        }
         client.start(username, password)
         val proxy = client.proxy()
 
@@ -96,12 +93,8 @@ class NodeMonitorModel {
 
         // Parties on network
         val (parties, futurePartyUpdate) = proxy.networkMapUpdates()
-        futurePartyUpdate.startWith(parties.map { NetworkMapCache.MapChange(it, null, NetworkMapCache.MapChangeType.Added) }).subscribe(networkMapSubject)
+        futurePartyUpdate.startWith(parties.map { MapChange.Added(it) }).subscribe(networkMapSubject)
 
-        // Client -> Service
-        clientToServiceSource.subscribe {
-            proxy.startFlow(::CashFlow, it)
-        }
         proxyObservable.set(proxy)
     }
 }

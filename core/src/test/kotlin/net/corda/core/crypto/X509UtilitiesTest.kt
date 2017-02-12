@@ -2,7 +2,6 @@ package net.corda.core.crypto
 
 import net.corda.core.div
 import org.bouncycastle.asn1.x500.X500Name
-import org.bouncycastle.asn1.x500.style.BCStyle
 import org.bouncycastle.asn1.x509.GeneralName
 import org.junit.Rule
 import org.junit.Test
@@ -61,23 +60,17 @@ class X509UtilitiesTest {
         serverCert.verify(caCertAndKey.keyPair.public) // throws on verification problems
         assertFalse { serverCert.keyUsage[5] } // Bit 5 == keyCertSign according to ASN.1 spec (see full comment on KeyUsage property)
         assertTrue { serverCert.basicConstraints === -1 } // This returns the signing path length should be -1 for non-CA certificate
-        assertEquals(3, serverCert.subjectAlternativeNames.size)
-        var foundMainDnsName = false
+        assertEquals(2, serverCert.subjectAlternativeNames.size)
         var foundAliasDnsName = false
         for (entry in serverCert.subjectAlternativeNames) {
             val typeId = entry[0] as Int
             val value = entry[1] as String
             if (typeId == GeneralName.iPAddress) {
                 assertEquals("10.0.0.54", value)
-            } else if (typeId == GeneralName.dNSName) {
-                if (value == "Server Cert") {
-                    foundMainDnsName = true
-                } else if (value == "alias name") {
+            } else if (value == "alias name") {
                     foundAliasDnsName = true
-                }
             }
         }
-        assertTrue(foundMainDnsName)
         assertTrue(foundAliasDnsName)
     }
 
@@ -145,7 +138,7 @@ class X509UtilitiesTest {
         val caCertAndKey = X509Utilities.loadCertificateAndKey(caKeyStore, "cakeypass", X509Utilities.CORDA_INTERMEDIATE_CA_PRIVATE_KEY)
 
         // Generate server cert and private key and populate another keystore suitable for SSL
-        X509Utilities.createKeystoreForSSL(tmpServerKeyStore, "serverstorepass", "serverkeypass", caKeyStore, "cakeypass")
+        X509Utilities.createKeystoreForSSL(tmpServerKeyStore, "serverstorepass", "serverkeypass", caKeyStore, "cakeypass", "Mega Corp.")
 
         // Load back server certificate
         val serverKeyStore = X509Utilities.loadKeyStore(tmpServerKeyStore, "serverstorepass")
@@ -153,9 +146,8 @@ class X509UtilitiesTest {
 
         serverCertAndKey.certificate.checkValidity(Date())
         serverCertAndKey.certificate.verify(caCertAndKey.certificate.publicKey)
-        val host = InetAddress.getLocalHost()
 
-        assertTrue { serverCertAndKey.certificate.subjectDN.name.contains("CN=" + host.canonicalHostName) }
+        assertTrue { serverCertAndKey.certificate.subjectDN.name.contains("CN=Mega Corp.") }
 
         // Now sign something with private key and verify against certificate public key
         val testData = "123456".toByteArray()
@@ -183,7 +175,7 @@ class X509UtilitiesTest {
                 "trustpass")
 
         // Generate server cert and private key and populate another keystore suitable for SSL
-        val keyStore = X509Utilities.createKeystoreForSSL(tmpServerKeyStore, "serverstorepass", "serverstorepass", caKeyStore, "cakeypass")
+        val keyStore = X509Utilities.createKeystoreForSSL(tmpServerKeyStore, "serverstorepass", "serverstorepass", caKeyStore, "cakeypass", "Mega Corp.")
         val trustStore = X509Utilities.loadKeyStore(tmpTrustStore, "trustpass")
 
         val context = SSLContext.getInstance("TLS")
@@ -256,9 +248,7 @@ class X509UtilitiesTest {
         val peerChain = clientSocket.session.peerCertificates
         val peerX500Principal = (peerChain[0] as X509Certificate).subjectX500Principal
         val x500name = X500Name(peerX500Principal.name)
-        val cn = x500name.getRDNs(BCStyle.CN).first().first.value.toString()
-        val hostname = InetAddress.getLocalHost().canonicalHostName
-        assertEquals(hostname, cn)
+        assertEquals("Mega Corp.", x500name.commonName)
 
 
         val output = DataOutputStream(clientSocket.outputStream)

@@ -3,6 +3,8 @@ apply plugin: CanonicalizerPlugin
 apply plugin: 'net.corda.plugins.publish-utils'
 apply plugin: 'net.corda.plugins.quasar-utils'
 
+description 'Corda finance modules'
+
 repositories {
     mavenLocal()
     mavenCentral()
@@ -19,25 +21,13 @@ dependencies {
     compile project(':core')
 
     testCompile project(':test-utils')
-    testCompile 'junit:junit:4.12'
+    testCompile "junit:junit:$junit_version"
 }
 
 sourceSets {
     test {
         resources {
             srcDir "../config/test"
-        }
-    }
-}
-
-publishing {
-    publications {
-        finance(MavenPublication) {
-            from components.java
-            artifactId 'finance'
-
-            artifact sourceJar
-            artifact javadocJar
         }
     }
 }

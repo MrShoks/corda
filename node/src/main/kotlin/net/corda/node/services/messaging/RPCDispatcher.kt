@@ -8,16 +8,21 @@ import com.esotericsoftware.kryo.io.Output
 import com.google.common.annotations.VisibleForTesting
 import com.google.common.collect.HashMultimap
 import net.corda.core.ErrorOr
+import net.corda.core.crypto.commonName
+import net.corda.core.messaging.RPCOps
+import net.corda.core.messaging.RPCReturnsObservables
 import net.corda.core.serialization.SerializedBytes
 import net.corda.core.serialization.deserialize
 import net.corda.core.serialization.serialize
 import net.corda.core.utilities.debug
 import net.corda.node.services.RPCUserService
 import net.corda.node.services.User
+import net.corda.node.services.messaging.ArtemisMessagingComponent.Companion.NODE_USER
 import net.corda.node.utilities.AffinityExecutor
 import org.apache.activemq.artemis.api.core.Message
 import org.apache.activemq.artemis.api.core.client.ClientConsumer
 import org.apache.activemq.artemis.api.core.client.ClientMessage
+import org.bouncycastle.asn1.x500.X500Name
 import rx.Notification
 import rx.Observable
 import rx.Subscription
@@ -30,7 +35,8 @@ import java.util.concurrent.atomic.AtomicInteger
  * wrong system (you could just send a message). If you want complex customisation of how requests/responses
  * are handled, this is probably the wrong system.
  */
-abstract class RPCDispatcher(val ops: RPCOps, val userService: RPCUserService) {
+// TODO remove the nodeLegalName parameter once the webserver doesn't need special privileges
+abstract class RPCDispatcher(val ops: RPCOps, val userService: RPCUserService, val nodeLegalName: String) {
     // Throw an exception if there are overloaded methods
     private val methodTable = ops.javaClass.declaredMethods.groupBy { it.name }.mapValues { it.value.single() }
 
@@ -70,13 +76,14 @@ abstract class RPCDispatcher(val ops: RPCOps, val userService: RPCUserService) {
 
     fun dispatch(msg: ClientRPCRequestMessage) {
         val (argsBytes, replyTo, observationsTo, methodName) = msg
+        val kryo = createRPCKryo(observableSerializer = if (observationsTo != null) ObservableSerializer(observationsTo) else null)
 
         val response: ErrorOr<Any> = ErrorOr.catch {
             val method = methodTable[methodName] ?: throw RPCException("Received RPC for unknown method $methodName - possible client/server version skew?")
             if (method.isAnnotationPresent(RPCReturnsObservables::class.java) && observationsTo == null)
                 throw RPCException("Received RPC without any destination for observations, but the RPC returns observables")
 
-            val args = argsBytes.deserialize()
+            val args = argsBytes.deserialize(kryo)
 
             rpcLog.debug { "-> RPC -> $methodName(${args.joinToString()})    [reply to $replyTo]" }
 
@@ -88,7 +95,6 @@ abstract class RPCDispatcher(val ops: RPCOps, val userService: RPCUserService) {
         }
         rpcLog.debug { "<- RPC <- $methodName = $response " }
 
-        val kryo = createRPCKryo(observableSerializer = if (observationsTo != null) ObservableSerializer(observationsTo) else null)
 
         // Serialise, or send back a simple serialised ErrorOr structure if we couldn't do it.
         val responseBits = try {
@@ -143,8 +149,8 @@ abstract class RPCDispatcher(val ops: RPCOps, val userService: RPCUserService) {
     /** Convert an Artemis [ClientMessage] to a MQ-neutral [ClientRPCRequestMessage]. */
     private fun ClientMessage.toRPCRequestMessage(): ClientRPCRequestMessage {
         val user = getUser(this)
-        val replyTo = getAuthenticatedAddress(user, ClientRPCRequestMessage.REPLY_TO, true)!!
-        val observationsTo = getAuthenticatedAddress(user, ClientRPCRequestMessage.OBSERVATIONS_TO, false)
+        val replyTo = getReturnAddress(user, ClientRPCRequestMessage.REPLY_TO, true)!!
+        val observationsTo = getReturnAddress(user, ClientRPCRequestMessage.OBSERVATIONS_TO, false)
         val argBytes = ByteArray(bodySize).apply { bodyBuffer.readBytes(this) }
         if (argBytes.isEmpty()) {
             throw RPCException("empty serialized args")
@@ -153,17 +159,26 @@ abstract class RPCDispatcher(val ops: RPCOps, val userService: RPCUserService) {
         return ClientRPCRequestMessage(SerializedBytes(argBytes), replyTo, observationsTo, methodName, user)
     }
 
+    // TODO remove this User once webserver doesn't need it
+    private val nodeUser = User(NODE_USER, NODE_USER, setOf())
     @VisibleForTesting
     protected open fun getUser(message: ClientMessage): User {
-        return userService.getUser(message.requiredString(Message.HDR_VALIDATED_USER.toString()))!!
+        val validatedUser = message.requiredString(Message.HDR_VALIDATED_USER.toString())
+        val rpcUser = userService.getUser(validatedUser)
+        if (rpcUser != null) {
+            return rpcUser
+        } else if (X500Name(validatedUser).commonName == nodeLegalName) {
+            return nodeUser
+        } else {
+            throw IllegalArgumentException("Validated user '$validatedUser' is not an RPC user nor the NODE user")
+        }
     }
 
-    private fun ClientMessage.getAuthenticatedAddress(user: User, property: String, required: Boolean): String? {
-        val address: String? = if (required) requiredString(property) else getStringProperty(property)
-        val expectedAddressPrefix = "${ArtemisMessagingComponent.CLIENTS_PREFIX}${user.username}."
-        if (address != null && !address.startsWith(expectedAddressPrefix)) {
-            throw RPCException("$property address does not match up with the user")
+    private fun ClientMessage.getReturnAddress(user: User, property: String, required: Boolean): String? {
+        return if (containsProperty(property)) {
+            "${ArtemisMessagingComponent.CLIENTS_PREFIX}${user.username}.rpc.${getLongProperty(property)}"
+        } else {
+            if (required) throw RPCException("missing $property property") else null
         }
-        return address
     }
 }

@@ -61,6 +61,8 @@ inline fun <R> requireThat(body: Requirements.() -> R) = Requirements.body()
 
 //// Authenticated commands ///////////////////////////////////////////////////////////////////////////////////////////
 
+// TODO: Provide a version of select that interops with Java
+
 /** Filters the command list by type, party and public key all at once. */
 inline fun <reified T : CommandData> Collection<AuthenticatedObject<CommandData>>.select(signer: CompositeKey? = null,
                                                                                          party: Party? = null) =
@@ -68,6 +70,8 @@ inline fun <reified T : CommandData> Collection<AuthenticatedObject<CommandData>
                 filter { if (signer == null) true else signer in it.signers }.
                 filter { if (party == null) true else party in it.signingParties }.
                 map { AuthenticatedObject(it.signers, it.signingParties, it.value as T) }
+
+// TODO: Provide a version of select that interops with Java
 
 /** Filters the command list by type, parties and public keys all at once. */
 inline fun <reified T : CommandData> Collection<AuthenticatedObject<CommandData>>.select(signers: Collection<CompositeKey>?,
@@ -115,7 +119,7 @@ inline fun <reified T : MoveCommand> verifyMoveCommand(inputs: List<OwnableState
     val command = commands.requireSingleCommand<T>()
     val keysThatSigned = command.signers.toSet()
     requireThat {
-        "the owning keys are the same as the signing keys" by keysThatSigned.containsAll(owningPubKeys)
+        "the owning keys are a subset of the signing keys" by keysThatSigned.containsAll(owningPubKeys)
     }
     return command.value
 }

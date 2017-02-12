@@ -1,7 +1,9 @@
 package net.corda.irs.api
 
-import net.corda.core.node.ServiceHub
-import net.corda.core.node.services.linearHeadsOfType
+import net.corda.core.contracts.filterStatesOfType
+import net.corda.core.getOrThrow
+import net.corda.core.messaging.CordaRPCOps
+import net.corda.core.messaging.startFlow
 import net.corda.core.utilities.loggerFor
 import net.corda.irs.contract.InterestRateSwap
 import net.corda.irs.flows.AutoOfferFlow
@@ -10,6 +12,7 @@ import net.corda.irs.flows.UpdateBusinessDayFlow
 import java.net.URI
 import java.time.LocalDate
 import java.time.LocalDateTime
+import java.time.ZoneId
 import javax.ws.rs.*
 import javax.ws.rs.core.MediaType
 import javax.ws.rs.core.Response
@@ -35,23 +38,23 @@ import javax.ws.rs.core.Response
  * or if the demodate or population of deals should be reset (will only work while persistence is disabled).
  */
 @Path("irs")
-class InterestRateSwapAPI(val services: ServiceHub) {
+class InterestRateSwapAPI(val rpc: CordaRPCOps) {
 
     private val logger = loggerFor<InterestRateSwapAPI>()
 
     private fun generateDealLink(deal: InterestRateSwap.State) = "/api/irs/deals/" + deal.common.tradeID
 
     private fun getDealByRef(ref: String): InterestRateSwap.State? {
-        val states = services.vaultService.linearHeadsOfType<InterestRateSwap.State>().filterValues { it.state.data.ref == ref }
+        val states = rpc.vaultAndUpdates().first.filterStatesOfType<InterestRateSwap.State>().filter { it.state.data.ref == ref }
         return if (states.isEmpty()) null else {
-            val deals = states.values.map { it.state.data }
+            val deals = states.map { it.state.data }
             return if (deals.isEmpty()) null else deals[0]
         }
     }
 
     private fun getAllDeals(): Array<InterestRateSwap.State> {
-        val states = services.vaultService.linearHeadsOfType<InterestRateSwap.State>()
-        val swaps = states.values.map { it.state.data }.toTypedArray()
+        val states = rpc.vaultAndUpdates().first.filterStatesOfType<InterestRateSwap.State>()
+        val swaps = states.map { it.state.data }.toTypedArray()
         return swaps
     }
 
@@ -64,12 +67,12 @@ class InterestRateSwapAPI(val services: ServiceHub) {
     @Path("deals")
     @Consumes(MediaType.APPLICATION_JSON)
     fun storeDeal(newDeal: InterestRateSwap.State): Response {
-        try {
-            services.invokeFlowAsync(AutoOfferFlow.Requester::class.java, newDeal).resultFuture.get()
-            return Response.created(URI.create(generateDealLink(newDeal))).build()
+        return try {
+            rpc.startFlow(AutoOfferFlow::Requester, newDeal).returnValue.getOrThrow()
+            Response.created(URI.create(generateDealLink(newDeal))).build()
         } catch (ex: Throwable) {
             logger.info("Exception when creating deal: $ex")
-            return Response.status(Response.Status.INTERNAL_SERVER_ERROR).entity(ex.toString()).build()
+            Response.status(Response.Status.INTERNAL_SERVER_ERROR).entity(ex.toString()).build()
         }
     }
 
@@ -92,7 +95,7 @@ class InterestRateSwapAPI(val services: ServiceHub) {
         val priorDemoDate = fetchDemoDate()
         // Can only move date forwards
         if (newDemoDate.isAfter(priorDemoDate)) {
-            services.invokeFlowAsync(UpdateBusinessDayFlow.Broadcast::class.java, newDemoDate).resultFuture.get()
+            rpc.startFlow(UpdateBusinessDayFlow::Broadcast, newDemoDate).returnValue.getOrThrow()
             return Response.ok().build()
         }
         val msg = "demodate is already $priorDemoDate and can only be updated with a later date"
@@ -104,14 +107,14 @@ class InterestRateSwapAPI(val services: ServiceHub) {
     @Path("demodate")
     @Produces(MediaType.APPLICATION_JSON)
     fun fetchDemoDate(): LocalDate {
-        return LocalDateTime.now(services.clock).toLocalDate()
+        return LocalDateTime.ofInstant(rpc.currentNodeTime(), ZoneId.systemDefault()).toLocalDate()
     }
 
     @PUT
     @Path("restart")
     @Consumes(MediaType.APPLICATION_JSON)
     fun exitServer(): Response {
-        services.invokeFlowAsync(ExitServerFlow.Broadcast::class.java, 83).resultFuture.get()
+        rpc.startFlow(ExitServerFlow::Broadcast, 83).returnValue.getOrThrow()
         return Response.ok().build()
     }
 }

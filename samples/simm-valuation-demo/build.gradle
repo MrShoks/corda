@@ -1,5 +1,5 @@
 buildscript {
-    ext.strata_version = '1.0.0'
+    ext.strata_version = '1.1.2'
 }
 
 apply plugin: 'java'
@@ -34,19 +34,30 @@ sourceSets {
             srcDir "../../config/test"
         }
     }
+    integrationTest {
+        kotlin {
+            compileClasspath += main.output + test.output
+            runtimeClasspath += main.output + test.output
+            srcDir file('src/integration-test/kotlin')
+        }
+    }
+}
+
+configurations {
+    integrationTestCompile.extendsFrom testCompile
+    integrationTestRuntime.extendsFrom testRuntime
 }
 
 dependencies {
     compile "org.jetbrains.kotlin:kotlin-stdlib:$kotlin_version"
-    testCompile group: 'junit', name: 'junit', version: '4.11'
+    testCompile "junit:junit:$junit_version"
 
     // Corda integration dependencies
-    compile "net.corda:corda:$corda_version"   // TODO
+    runtime project(path: ":node:capsule", configuration: 'runtimeArtifacts')
     compile project(':core')
-    compile project(':client')
     compile project(':node')
     compile project(':finance')
-    compile project(':test-utils')
+    testCompile project(':test-utils')
 
     // Javax is required for webapis
     compile "org.glassfish.jersey.core:jersey-server:${jersey_version}"
@@ -65,12 +76,11 @@ dependencies {
     compile "com.opengamma.strata:strata-math:${strata_version}"
 }
 
-task deployNodes(type: net.corda.plugins.Cordform, dependsOn: [':install', 'build']) {
+task deployNodes(type: net.corda.plugins.Cordform, dependsOn: ['build']) {
     directory "./build/nodes"
     networkMap "Controller"
     node {
         name "Controller"
-        dirName "controller"
         nearestCity "London"
         advertisedServices = ["corda.notary.validating"]
         artemisPort 10002
@@ -79,7 +89,6 @@ task deployNodes(type: net.corda.plugins.Cordform, dependsOn: [':install', 'buil
     }
     node {
         name "Bank A"
-        dirName "nodea"
         nearestCity "London"
         advertisedServices = []
         artemisPort 10004
@@ -88,7 +97,6 @@ task deployNodes(type: net.corda.plugins.Cordform, dependsOn: [':install', 'buil
     }
     node {
         name "Bank B"
-        dirName "nodeb"
         nearestCity "New York"
         advertisedServices = []
         artemisPort 10006
@@ -97,7 +105,6 @@ task deployNodes(type: net.corda.plugins.Cordform, dependsOn: [':install', 'buil
     }
     node {
         name "Bank C"
-        dirName "nodec"
         nearestCity "tokyo"
         advertisedServices = []
         artemisPort 10008
@@ -106,6 +113,10 @@ task deployNodes(type: net.corda.plugins.Cordform, dependsOn: [':install', 'buil
     }
 }
 
+task integrationTest(type: Test, dependsOn: []) {
+    testClassesDir = sourceSets.integrationTest.output.classesDir
+    classpath = sourceSets.integrationTest.runtimeClasspath
+}
 
 task npmInstall(type: Exec) {
     workingDir 'src/main/web'

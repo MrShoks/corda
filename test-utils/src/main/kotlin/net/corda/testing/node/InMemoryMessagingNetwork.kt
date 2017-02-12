@@ -4,8 +4,11 @@ import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
 import com.google.common.util.concurrent.SettableFuture
 import net.corda.core.ThreadBox
+import net.corda.core.crypto.X509Utilities
 import net.corda.core.getOrThrow
 import net.corda.core.messaging.*
+import net.corda.core.node.ServiceEntry
+import net.corda.core.node.services.PartyInfo
 import net.corda.core.serialization.SingletonSerializeAsToken
 import net.corda.core.utilities.trace
 import net.corda.node.services.api.MessagingServiceBuilder
@@ -14,6 +17,8 @@ import net.corda.node.utilities.AffinityExecutor
 import net.corda.node.utilities.JDBCHashSet
 import net.corda.node.utilities.databaseTransaction
 import net.corda.testing.node.InMemoryMessagingNetwork.InMemoryMessaging
+import org.apache.activemq.artemis.utils.ReusableLatch
+import org.bouncycastle.asn1.x500.X500Name
 import org.jetbrains.exposed.sql.Database
 import org.slf4j.LoggerFactory
 import rx.Observable
@@ -32,19 +37,26 @@ import kotlin.concurrent.thread
  * messages one by one to registered handlers. Alternatively, a messaging system may be manually pumped, in which
  * case no thread is created and a caller is expected to force delivery one at a time (this is useful for unit
  * testing).
+ *
+ * @param servicePeerAllocationStrategy defines the strategy to be used when determining which peer to send to in case
+ *     a service is addressed.
  */
 @ThreadSafe
-class InMemoryMessagingNetwork(val sendManuallyPumped: Boolean) : SingletonSerializeAsToken() {
+class InMemoryMessagingNetwork(
+        val sendManuallyPumped: Boolean,
+        val servicePeerAllocationStrategy: ServicePeerAllocationStrategy = InMemoryMessagingNetwork.ServicePeerAllocationStrategy.Random(),
+        private val messagesInFlight: ReusableLatch = ReusableLatch()
+) : SingletonSerializeAsToken() {
     companion object {
         val MESSAGES_LOG_NAME = "messages"
         private val log = LoggerFactory.getLogger(MESSAGES_LOG_NAME)
     }
 
     private var counter = 0   // -1 means stopped.
-    private val handleEndpointMap = HashMap<Handle, InMemoryMessaging>()
+    private val handleEndpointMap = HashMap<PeerHandle, InMemoryMessaging>()
 
-    data class MessageTransfer(val sender: InMemoryMessaging, val message: Message, val recipients: MessageRecipients) {
-        override fun toString() = "${message.topicSession} from '${sender.myAddress}' to '$recipients'"
+    data class MessageTransfer(val sender: PeerHandle, val message: Message, val recipients: MessageRecipients) {
+        override fun toString() = "${message.topicSession} from '$sender' to '$recipients'"
     }
 
     // All sent messages are kept here until pumpSend is called, or manuallyPumped is set to false
@@ -61,8 +73,11 @@ class InMemoryMessagingNetwork(val sendManuallyPumped: Boolean) : SingletonSeria
     // been created yet. If the node identified by the given handle has gone away/been shut down then messages
     // stack up here waiting for it to come back. The intent of this is to simulate a reliable messaging network.
     // The corresponding stream reflects when a message was pumpReceive'd
-    private val messageReceiveQueues = HashMap<Handle, LinkedBlockingQueue<MessageTransfer>>()
+    private val messageReceiveQueues = HashMap<PeerHandle, LinkedBlockingQueue<MessageTransfer>>()
     private val _receivedMessages = PublishSubject.create<MessageTransfer>()
+
+    // Holds the mapping from services to peers advertising the service.
+    private val serviceToPeersMapping = HashMap<ServiceHandle, LinkedHashSet<PeerHandle>>()
 
     @Suppress("unused") // Used by the visualiser tool.
     /** A stream of (sender, message, recipients) triples */
@@ -70,6 +85,7 @@ class InMemoryMessagingNetwork(val sendManuallyPumped: Boolean) : SingletonSeria
         get() = _receivedMessages
 
     val endpoints: List<InMemoryMessaging> @Synchronized get() = handleEndpointMap.values.toList()
+    fun endpoint(peer: PeerHandle): InMemoryMessaging? = handleEndpointMap.get(peer)
 
     /**
      * Creates a node and returns the new object that identifies its location on the network to senders, and the
@@ -85,10 +101,10 @@ class InMemoryMessagingNetwork(val sendManuallyPumped: Boolean) : SingletonSeria
     @Synchronized
     fun createNode(manuallyPumped: Boolean,
                    executor: AffinityExecutor,
-                   database: Database)
-            : Pair<Handle, MessagingServiceBuilder<InMemoryMessaging>> {
+                   advertisedServices: List<ServiceEntry>,
+                   database: Database): Pair<PeerHandle, MessagingServiceBuilder<InMemoryMessaging>> {
         check(counter >= 0) { "In memory network stopped: please recreate." }
-        val builder = createNodeWithID(manuallyPumped, counter, executor, database = database) as Builder
+        val builder = createNodeWithID(manuallyPumped, counter, executor, advertisedServices, database = database) as Builder
         counter++
         val id = builder.id
         return Pair(id, builder)
@@ -102,10 +118,15 @@ class InMemoryMessagingNetwork(val sendManuallyPumped: Boolean) : SingletonSeria
      * @param description text string that identifies this node for message logging (if is enabled) or null to autogenerate.
      * @param persistenceTx a lambda to wrap message handling in a transaction if necessary.
      */
-    fun createNodeWithID(manuallyPumped: Boolean, id: Int, executor: AffinityExecutor, description: String? = null,
-                         database: Database)
+    fun createNodeWithID(
+            manuallyPumped: Boolean,
+            id: Int,
+            executor: AffinityExecutor,
+            advertisedServices: List<ServiceEntry>,
+            description: String? = null,
+            database: Database)
             : MessagingServiceBuilder<InMemoryMessaging> {
-        return Builder(manuallyPumped, Handle(id, description ?: "In memory node $id"), executor, database = database)
+        return Builder(manuallyPumped, PeerHandle(id, description ?: "In memory node $id"), advertisedServices.map(::ServiceHandle), executor, database = database)
     }
 
     interface LatencyCalculator {
@@ -118,17 +139,25 @@ class InMemoryMessagingNetwork(val sendManuallyPumped: Boolean) : SingletonSeria
 
     @Synchronized
     private fun msgSend(from: InMemoryMessaging, message: Message, recipients: MessageRecipients) {
-        val transfer = MessageTransfer(from, message, recipients)
-        messageSendQueue.add(transfer)
+        messagesInFlight.countUp()
+        messageSendQueue += MessageTransfer(from.myAddress, message, recipients)
     }
 
     @Synchronized
-    private fun netNodeHasShutdown(handle: Handle) {
-        handleEndpointMap.remove(handle)
+    private fun netNodeHasShutdown(peerHandle: PeerHandle) {
+        handleEndpointMap.remove(peerHandle)
     }
 
     @Synchronized
-    private fun getQueueForHandle(recipients: Handle) = messageReceiveQueues.getOrPut(recipients) { LinkedBlockingQueue() }
+    private fun getQueueForPeerHandle(recipients: PeerHandle) = messageReceiveQueues.getOrPut(recipients) { LinkedBlockingQueue() }
+
+    @Synchronized
+    private fun getQueuesForServiceHandle(recipients: ServiceHandle): List<LinkedBlockingQueue<MessageTransfer>> {
+        return serviceToPeersMapping[recipients]!!.map {
+            messageReceiveQueues.getOrPut(it) { LinkedBlockingQueue() }
+        }
+    }
+
 
     val everyoneOnline: AllPossibleRecipients = object : AllPossibleRecipients {}
 
@@ -145,34 +174,66 @@ class InMemoryMessagingNetwork(val sendManuallyPumped: Boolean) : SingletonSeria
         messageReceiveQueues.clear()
     }
 
-    inner class Builder(val manuallyPumped: Boolean, val id: Handle, val executor: AffinityExecutor, val database: Database) : MessagingServiceBuilder<InMemoryMessaging> {
+    inner class Builder(
+            val manuallyPumped: Boolean,
+            val id: PeerHandle,
+            val serviceHandles: List<ServiceHandle>,
+            val executor: AffinityExecutor,
+            val database: Database) : MessagingServiceBuilder<InMemoryMessaging> {
         override fun start(): ListenableFuture<InMemoryMessaging> {
             synchronized(this@InMemoryMessagingNetwork) {
                 val node = InMemoryMessaging(manuallyPumped, id, executor, database)
                 handleEndpointMap[id] = node
+                serviceHandles.forEach {
+                    serviceToPeersMapping.getOrPut(it) { LinkedHashSet<PeerHandle>() }.add(id)
+                    Unit
+                }
                 return Futures.immediateFuture(node)
             }
         }
     }
 
-    class Handle(val id: Int, val description: String) : SingleMessageRecipient {
+    data class PeerHandle(val id: Int, val description: String) : SingleMessageRecipient {
         override fun toString() = description
-        override fun equals(other: Any?) = other is Handle && other.id == id
+        override fun equals(other: Any?) = other is PeerHandle && other.id == id
         override fun hashCode() = id.hashCode()
+    }
+
+    data class ServiceHandle(val service: ServiceEntry) : MessageRecipientGroup {
+        override fun toString() = "Service($service)"
+    }
+
+    /**
+     * Mock service loadbalancing
+     */
+    sealed class ServicePeerAllocationStrategy {
+        abstract fun <A> pickNext(service: ServiceHandle, pickFrom: List<A>): A
+        class Random(val random: SplittableRandom = SplittableRandom()) : ServicePeerAllocationStrategy() {
+            override fun <A> pickNext(service: ServiceHandle, pickFrom: List<A>): A {
+                return pickFrom[random.nextInt(pickFrom.size)]
+            }
+        }
+        class RoundRobin : ServicePeerAllocationStrategy() {
+            val previousPicks = HashMap<ServiceHandle, Int>()
+            override fun <A> pickNext(service: ServiceHandle, pickFrom: List<A>): A {
+                val nextIndex = previousPicks.compute(service) { _key, previous ->
+                    (previous?.plus(1) ?: 0) % pickFrom.size
+                }
+                return pickFrom[nextIndex]
+            }
+        }
     }
 
     // If block is set to true this function will only return once a message has been pushed onto the recipients' queues
     fun pumpSend(block: Boolean): MessageTransfer? {
         val transfer = (if (block) messageSendQueue.take() else messageSendQueue.poll()) ?: return null
-        val recipients = transfer.recipients
-        val from = transfer.sender.myAddress
 
         log.trace { transfer.toString() }
         val calc = latencyCalculator
-        if (calc != null && recipients is SingleMessageRecipient) {
+        if (calc != null && transfer.recipients is SingleMessageRecipient) {
             val messageSent = SettableFuture.create<Unit>()
             // Inject some artificial latency.
-            timer.schedule(calc.between(from, recipients).toMillis()) {
+            timer.schedule(calc.between(transfer.sender, transfer.recipients).toMillis()) {
                 pumpSendInternal(transfer)
                 messageSent.set(Unit)
             }
@@ -188,13 +249,17 @@ class InMemoryMessagingNetwork(val sendManuallyPumped: Boolean) : SingletonSeria
 
     fun pumpSendInternal(transfer: MessageTransfer) {
         when (transfer.recipients) {
-            is Handle -> getQueueForHandle(transfer.recipients).add(transfer)
-
+            is PeerHandle -> getQueueForPeerHandle(transfer.recipients).add(transfer)
+            is ServiceHandle -> {
+                val queues = getQueuesForServiceHandle(transfer.recipients)
+                val queue = servicePeerAllocationStrategy.pickNext(transfer.recipients, queues)
+                queue.add(transfer)
+            }
             is AllPossibleRecipients -> {
                 // This means all possible recipients _that the network knows about at the time_, not literally everyone
                 // who joins into the indefinite future.
                 for (handle in handleEndpointMap.keys)
-                    getQueueForHandle(handle).add(transfer)
+                    getQueueForPeerHandle(handle).add(transfer)
             }
             else -> throw IllegalArgumentException("Unknown type of recipient handle")
         }
@@ -210,24 +275,24 @@ class InMemoryMessagingNetwork(val sendManuallyPumped: Boolean) : SingletonSeria
      */
     @ThreadSafe
     inner class InMemoryMessaging(private val manuallyPumped: Boolean,
-                                  private val handle: Handle,
+                                  private val peerHandle: PeerHandle,
                                   private val executor: AffinityExecutor,
                                   private val database: Database) : SingletonSerializeAsToken(), MessagingServiceInternal {
         inner class Handler(val topicSession: TopicSession,
-                            val callback: (Message, MessageHandlerRegistration) -> Unit) : MessageHandlerRegistration
+                            val callback: (ReceivedMessage, MessageHandlerRegistration) -> Unit) : MessageHandlerRegistration
 
         @Volatile
         private var running = true
 
         private inner class InnerState {
             val handlers: MutableList<Handler> = ArrayList()
-            val pendingRedelivery = JDBCHashSet<Message>("pending_messages",loadOnInit = true)
+            val pendingRedelivery = JDBCHashSet<MessageTransfer>("pending_messages", loadOnInit = true)
         }
 
         private val state = ThreadBox(InnerState())
         private val processedMessages: MutableSet<UUID> = Collections.synchronizedSet(HashSet<UUID>())
 
-        override val myAddress: Handle get() = handle
+        override val myAddress: PeerHandle get() = peerHandle
 
         private val backgroundThread = if (manuallyPumped) null else
             thread(isDaemon = true, name = "In-memory message dispatcher") {
@@ -240,23 +305,29 @@ class InMemoryMessagingNetwork(val sendManuallyPumped: Boolean) : SingletonSeria
                 }
             }
 
-        override fun addMessageHandler(topic: String, sessionID: Long, callback: (Message, MessageHandlerRegistration) -> Unit): MessageHandlerRegistration
+        override fun getAddressOfParty(partyInfo: PartyInfo): MessageRecipients {
+            return when (partyInfo) {
+                is PartyInfo.Node -> partyInfo.node.address
+                is PartyInfo.Service -> ServiceHandle(partyInfo.service)
+            }
+        }
+
+        override fun addMessageHandler(topic: String, sessionID: Long, callback: (ReceivedMessage, MessageHandlerRegistration) -> Unit): MessageHandlerRegistration
                 = addMessageHandler(TopicSession(topic, sessionID), callback)
 
-        override fun addMessageHandler(topicSession: TopicSession, callback: (Message, MessageHandlerRegistration) -> Unit): MessageHandlerRegistration {
+        override fun addMessageHandler(topicSession: TopicSession, callback: (ReceivedMessage, MessageHandlerRegistration) -> Unit): MessageHandlerRegistration {
             check(running)
-            val (handler, items) = state.locked {
+            val (handler, transfers) = state.locked {
                 val handler = Handler(topicSession, callback).apply { handlers.add(this) }
-                val pending = ArrayList<Message>()
+                val pending = ArrayList<MessageTransfer>()
                 databaseTransaction(database) {
                     pending.addAll(pendingRedelivery)
                     pendingRedelivery.clear()
                 }
                 Pair(handler, pending)
             }
-            for (message in items) {
-                send(message, handle)
-            }
+
+            transfers.forEach { pumpSendInternal(it) }
             return handler
         }
 
@@ -279,7 +350,7 @@ class InMemoryMessagingNetwork(val sendManuallyPumped: Boolean) : SingletonSeria
                 backgroundThread.join()
             }
             running = false
-            netNodeHasShutdown(handle)
+            netNodeHasShutdown(peerHandle)
         }
 
         /** Returns the given (topic & session, data) pair as a newly created message object. */
@@ -323,9 +394,8 @@ class InMemoryMessagingNetwork(val sendManuallyPumped: Boolean) : SingletonSeria
             while (deliverTo == null) {
                 val transfer = (if (block) q.take() else q.poll()) ?: return null
                 deliverTo = state.locked {
-                    val h = handlers.filter { if (it.topicSession.isBlank()) true else transfer.message.topicSession == it.topicSession }
-
-                    if (h.isEmpty()) {
+                    val matchingHandlers = handlers.filter { it.topicSession.isBlank() || transfer.message.topicSession == it.topicSession }
+                    if (matchingHandlers.isEmpty()) {
                         // Got no handlers for this message yet. Keep the message around and attempt redelivery after a new
                         // handler has been registered. The purpose of this path is to make unit tests that have multi-threading
                         // reliable, as a sender may attempt to send a message to a receiver that hasn't finished setting
@@ -333,11 +403,11 @@ class InMemoryMessagingNetwork(val sendManuallyPumped: Boolean) : SingletonSeria
                         // least sometimes.
                         log.warn("Message to ${transfer.message.topicSession} could not be delivered")
                         databaseTransaction(database) {
-                            pendingRedelivery.add(transfer.message)
+                            pendingRedelivery.add(transfer)
                         }
                         null
                     } else {
-                        h
+                        matchingHandlers
                     }
                 }
                 if (deliverTo != null) {
@@ -348,7 +418,7 @@ class InMemoryMessagingNetwork(val sendManuallyPumped: Boolean) : SingletonSeria
         }
 
         private fun pumpReceiveInternal(block: Boolean): MessageTransfer? {
-            val q = getQueueForHandle(handle)
+            val q = getQueueForPeerHandle(peerHandle)
             val next = getNextQueue(q, block) ?: return null
             val (transfer, deliverTo) = next
 
@@ -357,19 +427,28 @@ class InMemoryMessagingNetwork(val sendManuallyPumped: Boolean) : SingletonSeria
                     databaseTransaction(database) {
                         for (handler in deliverTo) {
                             try {
-                                handler.callback(transfer.message, handler)
+                                handler.callback(transfer.toReceivedMessage(), handler)
                             } catch(e: Exception) {
                                 log.error("Caught exception in handler for $this/${handler.topicSession}", e)
                             }
                         }
                         _receivedMessages.onNext(transfer)
                         processedMessages += transfer.message.uniqueMessageId
+                        messagesInFlight.countDown()
                     }
                 }
             } else {
                 log.info("Drop duplicate message ${transfer.message.uniqueMessageId}")
             }
             return transfer
+        }
+
+        private fun MessageTransfer.toReceivedMessage() = object : ReceivedMessage {
+            override val topicSession: TopicSession get() = message.topicSession
+            override val data: ByteArray get() = message.data.copyOf() // Kryo messes with the buffer so give each client a unique copy
+            override val peer: X500Name get() = X509Utilities.getDevX509Name(sender.description)
+            override val debugTimestamp: Instant get() = message.debugTimestamp
+            override val uniqueMessageId: UUID get() = message.uniqueMessageId
         }
     }
 }

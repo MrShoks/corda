@@ -1,7 +1,7 @@
 package net.corda.node.services
 
 import net.corda.core.flows.FlowLogic
-import net.corda.node.services.config.FullNodeConfiguration
+import net.corda.node.services.config.NodeConfiguration
 
 /**
  * Service for retrieving [User] objects representing RPC users who are authorised to use the RPC system. A [User]
@@ -15,7 +15,7 @@ interface RPCUserService {
 
 // TODO Store passwords as salted hashes
 // TODO Or ditch this and consider something like Apache Shiro
-class RPCUserServiceImpl(config: FullNodeConfiguration) : RPCUserService {
+class RPCUserServiceImpl(config: NodeConfiguration) : RPCUserService {
 
     private val _users = config.rpcUsers.associateBy(User::username)
 
@@ -28,5 +28,6 @@ data class User(val username: String, val password: String, val permissions: Set
     override fun toString(): String = "${javaClass.simpleName}($username, permissions=$permissions)"
 }
 
-fun <P : FlowLogic<*>> startFlowPermission(clazz: Class<P>) = "StartFlow.${clazz.name}"
+fun startFlowPermission(className: String) = "StartFlow.$className"
+fun <P : FlowLogic<*>> startFlowPermission(clazz: Class<P>) = startFlowPermission(clazz.name)
 inline fun <reified P : FlowLogic<*>> startFlowPermission(): String = startFlowPermission(P::class.java)

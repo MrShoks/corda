@@ -5,12 +5,14 @@ import co.paralleluniverse.io.serialization.kryo.KryoSerializer
 import com.esotericsoftware.kryo.Kryo
 import com.esotericsoftware.kryo.Kryo.DefaultInstantiatorStrategy
 import com.esotericsoftware.kryo.KryoException
+import com.esotericsoftware.kryo.Registration
 import com.esotericsoftware.kryo.Serializer
 import com.esotericsoftware.kryo.io.Input
 import com.esotericsoftware.kryo.io.Output
 import com.esotericsoftware.kryo.serializers.JavaSerializer
 import com.esotericsoftware.kryo.serializers.MapSerializer
 import de.javakaffee.kryoserializers.ArraysAsListSerializer
+import de.javakaffee.kryoserializers.UnmodifiableCollectionsSerializer
 import de.javakaffee.kryoserializers.guava.*
 import net.corda.core.contracts.*
 import net.corda.core.crypto.*
@@ -25,12 +27,11 @@ import net.i2p.crypto.eddsa.EdDSAPublicKey
 import net.i2p.crypto.eddsa.spec.EdDSAPrivateKeySpec
 import net.i2p.crypto.eddsa.spec.EdDSAPublicKeySpec
 import org.objenesis.strategy.StdInstantiatorStrategy
-import java.io.ByteArrayOutputStream
-import java.io.ObjectInputStream
-import java.io.ObjectOutputStream
+import java.io.*
 import java.lang.reflect.InvocationTargetException
 import java.nio.file.Files
 import java.nio.file.Path
+import java.security.PublicKey
 import java.time.Instant
 import java.util.*
 import javax.annotation.concurrent.ThreadSafe
@@ -66,7 +67,7 @@ import kotlin.reflect.jvm.javaType
  */
 
 // A convenient instance of Kryo pre-configured with some useful things. Used as a default by various functions.
-val THREAD_LOCAL_KRYO = ThreadLocal.withInitial { createKryo() }
+val THREAD_LOCAL_KRYO: ThreadLocal<Kryo> = ThreadLocal.withInitial { createKryo() }
 
 /**
  * A type safe wrapper around a byte array that contains a serialised object. You can call [SerializedBytes.deserialize]
@@ -76,7 +77,7 @@ class SerializedBytes<T : Any>(bytes: ByteArray) : OpaqueBytes(bytes) {
     // It's OK to use lazy here because SerializedBytes is configured to use the ImmutableClassSerializer.
     val hash: SecureHash by lazy { bytes.sha256() }
 
-    fun writeToFile(path: Path) = Files.write(path, bytes)
+    fun writeToFile(path: Path): Path = Files.write(path, bytes)
 }
 
 // Some extension functions that make deserialisation convenient and provide auto-casting of the result.
@@ -201,6 +202,44 @@ class ImmutableClassSerializer<T : Any>(val klass: KClass<T>) : Serializer<T>() 
     }
 }
 
+// TODO This is a temporary inefficient serialiser for sending InputStreams through RPC. This may be done much more
+// efficiently using Artemis's large message feature.
+object InputStreamSerializer : Serializer<InputStream>() {
+    override fun write(kryo: Kryo, output: Output, stream: InputStream) {
+        val buffer = ByteArray(4096)
+        while (true) {
+            val numberOfBytesRead = stream.read(buffer)
+            if (numberOfBytesRead != -1) {
+                output.writeInt(numberOfBytesRead, true)
+                output.writeBytes(buffer, 0, numberOfBytesRead)
+            } else {
+                output.writeInt(0)
+                break
+            }
+        }
+    }
+
+    override fun read(kryo: Kryo, input: Input, type: Class<InputStream>): InputStream {
+        val chunks = ArrayList<ByteArray>()
+        while (true) {
+            val chunk = input.readBytesWithLength()
+            if (chunk.isEmpty()) {
+                break
+            } else {
+                chunks.add(chunk)
+            }
+        }
+        val flattened = ByteArray(chunks.sumBy { it.size })
+        var offset = 0
+        for (chunk in chunks) {
+            System.arraycopy(chunk, 0, flattened, offset, chunk.size)
+            offset += chunk.size
+        }
+        return ByteArrayInputStream(flattened)
+    }
+
+}
+
 inline fun <T> Kryo.useClassLoader(cl: ClassLoader, body: () -> T): T {
     val tmp = this.classLoader ?: ClassLoader.getSystemClassLoader()
     this.classLoader = cl
@@ -302,6 +341,41 @@ object Ed25519PublicKeySerializer : Serializer<EdDSAPublicKey>() {
     }
 }
 
+/** For serialising composite keys */
+@ThreadSafe
+object CompositeKeyLeafSerializer : Serializer<CompositeKey.Leaf>() {
+    override fun write(kryo: Kryo, output: Output, obj: CompositeKey.Leaf) {
+        val key = obj.publicKey
+        kryo.writeClassAndObject(output, key)
+    }
+
+    override fun read(kryo: Kryo, input: Input, type: Class<CompositeKey.Leaf>): CompositeKey.Leaf {
+        val key = kryo.readClassAndObject(input) as PublicKey
+        return CompositeKey.Leaf(key)
+    }
+}
+
+@ThreadSafe
+object CompositeKeyNodeSerializer : Serializer<CompositeKey.Node>() {
+    override fun write(kryo: Kryo, output: Output, obj: CompositeKey.Node) {
+        output.writeInt(obj.threshold)
+        output.writeInt(obj.children.size)
+        obj.children.forEach { kryo.writeClassAndObject(output, it) }
+        output.writeInts(obj.weights.toIntArray())
+    }
+
+    override fun read(kryo: Kryo, input: Input, type: Class<CompositeKey.Node>): CompositeKey.Node {
+        val threshold = input.readInt()
+        val childCount = input.readInt()
+        val children = (1..childCount).map { kryo.readClassAndObject(input) as CompositeKey }
+        val weights = input.readInts(childCount)
+
+        val builder = CompositeKey.Builder()
+        weights.zip(children).forEach { builder.addKey(it.second, it.first)  }
+        return builder.build(threshold)
+    }
+}
+
 /** Marker interface for kotlin object definitions so that they are deserialized as the singleton instance. */
 interface DeserializeAsKotlinObjectDef
 
@@ -312,8 +386,7 @@ object KotlinObjectSerializer : Serializer<DeserializeAsKotlinObjectDef>() {
         return type.getField("INSTANCE").get(null) as DeserializeAsKotlinObjectDef
     }
 
-    override fun write(kryo: Kryo, output: Output, obj: DeserializeAsKotlinObjectDef) {
-    }
+    override fun write(kryo: Kryo, output: Output, obj: DeserializeAsKotlinObjectDef) {}
 }
 
 fun createKryo(k: Kryo = Kryo()): Kryo {
@@ -329,20 +402,18 @@ fun createKryo(k: Kryo = Kryo()): Kryo {
         // Because we like to stick a Kryo object in a ThreadLocal to speed things up a bit, we can end up trying to
         // serialise the Kryo object itself when suspending a fiber. That's dumb, useless AND can cause crashes, so
         // we avoid it here.
-        register(Kryo::class.java, object : Serializer<Kryo>() {
-            override fun write(kryo: Kryo, output: Output, obj: Kryo) {
-            }
+        register(Kryo::class,
+                read = { kryo, input -> createKryo((Fiber.getFiberSerializer() as KryoSerializer).kryo) },
+                write = { kryo, output, obj -> }
+        )
 
-            override fun read(kryo: Kryo, input: Input, type: Class<Kryo>): Kryo {
-                return createKryo((Fiber.getFiberSerializer() as KryoSerializer).kryo)
-            }
-        })
-
-        // Some things where the JRE provides an efficient custom serialisation.
-        val keyPair = generateKeyPair()
-        register(keyPair.public.javaClass, Ed25519PublicKeySerializer)
-        register(keyPair.private.javaClass, Ed25519PrivateKeySerializer)
+        register(EdDSAPublicKey::class.java, Ed25519PublicKeySerializer)
+        register(EdDSAPrivateKey::class.java, Ed25519PrivateKeySerializer)
         register(Instant::class.java, ReferencesAwareJavaSerializer)
+
+        // Using a custom serializer for compactness
+        register(CompositeKey.Node::class.java, CompositeKeyNodeSerializer)
+        register(CompositeKey.Leaf::class.java, CompositeKeyLeafSerializer)
 
         // Some classes have to be handled with the ImmutableClassSerializer because they need to have their
         // constructors be invoked (typically for lazy members).
@@ -362,9 +433,14 @@ fun createKryo(k: Kryo = Kryo()): Kryo {
         // This ensures a NonEmptySetSerializer is constructed with an initial value.
         register(NonEmptySet::class.java, NonEmptySetSerializer)
 
+        register(Array<StackTraceElement>::class, read = { kryo, input -> emptyArray() }, write = { kryo, output, o -> })
+
         /** This ensures any kotlin objects that implement [DeserializeAsKotlinObjectDef] are read back in as singletons. */
         addDefaultSerializer(DeserializeAsKotlinObjectDef::class.java, KotlinObjectSerializer)
 
+        addDefaultSerializer(BufferedInputStream::class.java, InputStreamSerializer)
+
+        UnmodifiableCollectionsSerializer.registerSerializers(k)
         ImmutableListSerializer.registerSerializers(k)
         ImmutableSetSerializer.registerSerializers(k)
         ImmutableSortedSetSerializer.registerSerializers(k)
@@ -373,6 +449,19 @@ fun createKryo(k: Kryo = Kryo()): Kryo {
 
         noReferencesWithin<WireTransaction>()
     }
+}
+
+inline fun <T : Any> Kryo.register(
+        type: KClass<T>,
+        crossinline read: (Kryo, Input) -> T,
+        crossinline write: (Kryo, Output, T) -> Unit): Registration {
+    return register(
+            type.java,
+            object : Serializer<T>() {
+                override fun read(kryo: Kryo, input: Input, type: Class<T>): T = read(kryo, input)
+                override fun write(kryo: Kryo, output: Output, obj: T) = write(kryo, output, obj)
+            }
+    )
 }
 
 /**
@@ -441,7 +530,7 @@ var Kryo.attachmentStorage: AttachmentStorage?
 //Used in Merkle tree calculation. It doesn't cover all the cases of unstable serialization format.
 fun extendKryoHash(kryo: Kryo): Kryo {
     return kryo.apply {
-        setReferences(false)
+        references = false
         register(LinkedHashMap::class.java, MapSerializer())
         register(HashMap::class.java, OrderedSerializer)
     }

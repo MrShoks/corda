@@ -1,6 +1,7 @@
 package net.corda.core.contracts
 
 import net.corda.core.contracts.clauses.Clause
+import net.corda.core.crypto.AnonymousParty
 import net.corda.core.crypto.CompositeKey
 import net.corda.core.crypto.Party
 import net.corda.core.crypto.SecureHash
@@ -114,42 +115,41 @@ interface ContractState {
      * list should just contain the owner.
      */
     val participants: List<CompositeKey>
-
-    /**
-     * All contract states may be _encumbered_ by up to one other state.
-     *
-     * The encumbrance state, if present, forces additional controls over the encumbered state, since the platform checks
-     * that the encumbrance state is present as an input in the same transaction that consumes the encumbered state, and
-     * the contract code and rules of the encumbrance state will also be verified during the execution of the transaction.
-     * For example, a cash contract state could be encumbered with a time-lock contract state; the cash state is then only
-     * processable in a transaction that verifies that the time specified in the encumbrance time-lock has passed.
-     *
-     * The encumbered state refers to another by index, and the referred encumbrance state
-     * is an output state in a particular position on the same transaction that created the encumbered state. An alternative
-     * implementation would be encumber by reference to a StateRef., which would allow the specification of encumbrance
-     * by a state created in a prior transaction.
-     *
-     * Note that an encumbered state that is being consumed must have its encumbrance consumed in the same transaction,
-     * otherwise the transaction is not valid.
-     */
-    val encumbrance: Int? get() = null
 }
 
 /**
  * A wrapper for [ContractState] containing additional platform-level state information.
  * This is the definitive state that is stored on the ledger and used in transaction outputs.
  */
-data class TransactionState<out T : ContractState>(
+data class TransactionState<out T : ContractState> @JvmOverloads constructor(
         /** The custom contract state */
         val data: T,
         /** Identity of the notary that ensures the state is not used as an input to a transaction more than once */
-        val notary: Party) {
+        val notary: Party,
+        /**
+         * All contract states may be _encumbered_ by up to one other state.
+         *
+         * The encumbrance state, if present, forces additional controls over the encumbered state, since the platform checks
+         * that the encumbrance state is present as an input in the same transaction that consumes the encumbered state, and
+         * the contract code and rules of the encumbrance state will also be verified during the execution of the transaction.
+         * For example, a cash contract state could be encumbered with a time-lock contract state; the cash state is then only
+         * processable in a transaction that verifies that the time specified in the encumbrance time-lock has passed.
+         *
+         * The encumbered state refers to another by index, and the referred encumbrance state
+         * is an output state in a particular position on the same transaction that created the encumbered state. An alternative
+         * implementation would be encumbering by reference to a [StateRef], which would allow the specification of encumbrance
+         * by a state created in a prior transaction.
+         *
+         * Note that an encumbered state that is being consumed must have its encumbrance consumed in the same transaction,
+         * otherwise the transaction is not valid.
+         */
+        val encumbrance: Int? = null) {
 
     /**
      * Copies the underlying state, replacing the notary field with the new value.
      * To replace the notary, we need an approval (signature) from _all_ participants of the [ContractState].
      */
-    fun withNotary(newNotary: Party) = TransactionState(this.data, newNotary)
+    fun withNotary(newNotary: Party) = TransactionState(this.data, newNotary, encumbrance)
 }
 
 /** Wraps the [ContractState] in a [TransactionState] object */
@@ -350,8 +350,8 @@ inline fun <reified T : ContractState> Iterable<StateAndRef<ContractState>>.filt
  * Reference to something being stored or issued by a party e.g. in a vault or (more likely) on their normal
  * ledger. The reference is intended to be encrypted so it's meaningless to anyone other than the party.
  */
-data class PartyAndReference(val party: Party, val reference: OpaqueBytes) {
-    override fun toString() = "${party.name}$reference"
+data class PartyAndReference(val party: AnonymousParty, val reference: OpaqueBytes) {
+    override fun toString() = "${party}$reference"
 }
 
 /** Marker interface for classes that represent commands */
@@ -381,7 +381,7 @@ interface IssueCommand : CommandData {
     val nonce: Long
 }
 
-/** A common move command for contracts which can change owner. */
+/** A common move command for contract states which can change owner. */
 interface MoveCommand : CommandData {
     /**
      * Contract code the moved state(s) are for the attention of, for example to indicate that the states are moved in
@@ -396,6 +396,9 @@ interface NetCommand : CommandData {
     /** The type of netting to apply, see [NetType] for options. */
     val type: NetType
 }
+
+/** Indicates that this transaction replaces the inputs contract state to another contract state */
+data class UpgradeCommand(val upgradedContractClass: Class<UpgradedContract<*, *>>) : CommandData
 
 /** Wraps an object that was signed by a public key, which may be a well known/recognised institutional key. */
 data class AuthenticatedObject<out T : Any>(
@@ -446,6 +449,24 @@ interface Contract {
 }
 
 /**
+ * Interface which can upgrade state objects issued by a contract to a new state object issued by a different contract.
+ *
+ * @param OldState the old contract state (can be [ContractState] or other common supertype if this supports upgrading
+ * more than one state).
+ * @param NewState the upgraded contract state.
+ */
+interface UpgradedContract<in OldState : ContractState, out NewState : ContractState> : Contract {
+    val legacyContract: Contract
+    /**
+     * Upgrade contract's state object to a new state object.
+     *
+     * @throws IllegalArgumentException if the given state object is not one that can be upgraded. This can be either
+     * that the class is incompatible, or that the data inside the state object cannot be upgraded for some reason.
+     */
+    fun upgrade(state: OldState): NewState
+}
+
+/**
  * An attachment is a ZIP (or an optionally signed JAR) that contains one or more files. Attachments are meant to
  * contain public static data which can be referenced from transactions and utilised from contracts. Good examples
  * of how attachments are meant to be used include:
@@ -480,5 +501,3 @@ interface Attachment : NamedByHash {
         throw FileNotFoundException()
     }
 }
-
-
